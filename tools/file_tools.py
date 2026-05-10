@@ -1,13 +1,13 @@
 import os
 from pathlib import Path
-import subprocess
 from dotenv import load_dotenv
+from langchain_core.tools import tool
 
 # Загрузка переменных окружения
 load_dotenv()
 
 # Путь к директории скрипта
-SCRIPT_DIR = Path(__file__).resolve().parent
+SCRIPT_DIR = Path(__file__).resolve().parent.parent
 WORK_DIR = SCRIPT_DIR / "workdir"
 
 from pathlib import Path
@@ -52,41 +52,47 @@ def _safe_path(path: str, base_dir: Path) -> Path:
         )
 
 # --- Функции для работы с каталогами ---
-def list_dir(path: str = "") -> list:
+@tool
+def list_dir(path: str = "") -> str:
     """
     Возвращает список элементов директории с указанием типа: файл или папка.
-    Пример результата:
-    [
-        {"name": "src",       "dir": true},
-        {"name": "main.py",   "dir": false},
-        {"name": "config.json", "dir": false}
-    ]
+    Возвращает строку с результатом или сообщение об ошибке.
     """
     dir_path = _safe_path(path, WORK_DIR)
     
+    # Проверяем существование директории
     if not os.path.exists(dir_path):
-        raise FileNotFoundError(f"Директория не найдена: {path}")
+        return f"❌ Директория не найдена: '{path}'"
     
     if not os.path.isdir(dir_path):
-        raise NotADirectoryError(f"Путь не является директорией: {path}")
-
-    items = []
-    for name in os.listdir(dir_path):
-        item_path = os.path.join(dir_path, name)
-        item_type = True if os.path.isdir(item_path) else False
-        items.append({
-            "name": name,
-            "dir": item_type
-        })
+        return f"❌ Путь не является директорией: '{path}'"
     
-    return items
+    try:
+        items = []
+        for name in os.listdir(dir_path):
+            item_path = os.path.join(dir_path, name)
+            item_type = "📁" if os.path.isdir(item_path) else "📄"
+            items.append(f"{item_type} {name}")
+        
+        if not items:
+            return f"📁 Директория '{path}' пуста"
+        
+        result = f"Содержимое '{path}':\n" + "\n".join(items)
+        return result
+        
+    except PermissionError:
+        return f"❌ Нет прав на чтение директории: '{path}'"
+    except Exception as e:
+        return f"❌ Ошибка при чтении директории: {str(e)}"
 
+@tool
 def create_dir(path: str) -> bool:
     """Создает директорию."""
     dir_path = _safe_path(path, WORK_DIR)
     dir_path.mkdir(parents=True, exist_ok=True)
     return True
 
+@tool
 def delete_dir(path: str) -> bool:
     """Удаляет директорию."""
     dir_path = _safe_path(path, WORK_DIR)
@@ -100,6 +106,7 @@ def delete_dir(path: str) -> bool:
     dir_path.rmdir()
     return True
 
+@tool
 # --- Функции для работы с файлами ---
 def read_file(path: str, encoding: str = "utf-8") -> str:
     """Читает файл. Если путь относительный, ищет в SOURCE_DIR, иначе в WORK_DIR."""
@@ -108,12 +115,21 @@ def read_file(path: str, encoding: str = "utf-8") -> str:
     mode = "r"
     if (WORK_DIR / 'src').resolve() in file_path.parents:
         encoding="cp1251"
+    
+    # Проверяем существование файла
+    if not os.path.exists(file_path):
+        return f"❌ Файл не найден: '{path}'"
+    
+    if os.path.isdir(file_path):
+        return f"❌ Путь является директорией, а не файлом: '{path}'"    
+    
     try:
         with open(file_path, mode, encoding=encoding) as f:
             return f.read()
     except Exception as e:
         raise ValueError(f'Error read file: {file_path}, encoding: {encoding}, message: {e}') from e
 
+@tool
 def write_file(path: str, content: str, overwrite: bool = False) -> bool:
     """
     Записывает файл в рабочую директорию.
@@ -123,16 +139,18 @@ def write_file(path: str, content: str, overwrite: bool = False) -> bool:
     file_path.parent.mkdir(parents=True, exist_ok=True)
 
     if file_path.exists() and not overwrite:
-        raise FileExistsError(f"Файл уже существует: {path}. Используй overwrite=True для перезаписи.")
+        return f"❌ Файл уже существует: '{path}'. Используй overwrite=True для перезаписи"
 
     with open(file_path, "w", encoding="utf-8") as f:
         f.write(content)
     return True
 
+@tool
 def create_file(path: str, content: str) -> bool:
     """Создает файл с контентом. Ошибается, если файл уже есть."""
     return write_file(path, content, overwrite=False)  # Явно запрещаем перезапись
 
+@tool
 def delete_file(path: str) -> bool:
     """Удаляет файл."""
     file_path = _safe_path(path, WORK_DIR)
@@ -141,8 +159,7 @@ def delete_file(path: str) -> bool:
         return True
     return False
 
-# --- Функции проверки существования ---
-
+@tool
 def file_exists(path: str) -> bool:
     """
     Проверяет, существует ли файл.
@@ -154,7 +171,7 @@ def file_exists(path: str) -> bool:
     except (PermissionError, ValueError):
         return False
 
-
+@tool
 def dir_exists(path: str) -> bool:
     """
     Проверяет, существует ли директория.
@@ -166,61 +183,14 @@ def dir_exists(path: str) -> bool:
     except (PermissionError, ValueError):
         return False
 
-def npm_install(path: str, options: str):
-    """
-    Выполнение установки пакетов
-    """
-    try:
-        full_path = _safe_path(path, WORK_DIR)
-        command = f'npm install {options}'
-        print(f"🖥️ Выполняется: {command}")
-        result = subprocess.run(
-            command, shell=True, capture_output=True, text=True,
-            timeout=120, cwd=full_path
-        )
-        output = result.stdout if result.stdout else result.stderr if result.stderr else "✅ Выполнено (нет вывода)"
-        return output
-    except subprocess.TimeoutExpired:
-        return "❌ Команда выполнялась слишком долго (>120 сек)"
-    except Exception as e:
-        return f"Ошибка: {str(e)}"
-
-def npm_build(path: str, options: str):
-    """
-    Построение проекта
-    """
-    try:
-        full_path = _safe_path(path, WORK_DIR)
-        command = f'npm build {options}'
-        print(f"🖥️ Выполняется: {command}")
-        result = subprocess.run(
-            command, shell=True, capture_output=True, text=True,
-            timeout=180, cwd=full_path
-        )
-        output = result.stdout if result.stdout else result.stderr if result.stderr else "✅ Выполнено (нет вывода)"
-        return output
-    except subprocess.TimeoutExpired:
-        return "❌ Команда выполнялась слишком долго (>180 сек)"
-    except Exception as e:
-        return f"Ошибка: {str(e)}"
-
-# def chdir(path: str) -> str:
-#     """Реально меняет текущую директорию процесса"""
-#     try:
-#         full_path = _safe_path(path, WORK_DIR)
-#         os.chdir(full_path)
-#         new_cwd = os.getcwd()
-#         print(f"📁 Директория изменена на: {new_cwd}")
-#         return f"✅ Текущая директория изменена на: {new_cwd}"
-#     except Exception as e:
-#         return f"❌ Ошибка при смене директории: {str(e)}"
-
-
+@tool
 def pwd():
     """
     Получить путь к текущей рабочей директории
     """
     try:        
-        return os.getcwd()
+        # return os.getcwd()
+        return WORK_DIR
     except Exception as e:
         return f"Ошибка: {str(e)}"
+

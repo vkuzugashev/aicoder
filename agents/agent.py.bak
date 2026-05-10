@@ -1,0 +1,432 @@
+import os
+import asyncio
+import traceback
+from typing import Any, Dict
+
+import aiosqlite
+import httpx
+from langchain.chat_models import init_chat_model
+from langgraph.prebuilt import create_react_agent
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages.utils import trim_messages, count_tokens_approximately
+
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+
+from tools.code_base import search_codebase
+from tools.file_tools import (list_dir, read_file, write_file, create_dir, file_exists, dir_exists, 
+                   delete_dir, delete_file, pwd)
+from tools.build_tools import npm_install, npm_build
+
+os.environ['CURL_CA_BUNDLE'] = ''
+os.environ['REQUESTS_CA_BUNDLE'] = ''
+
+# ===== КОНСТАНТЫ =====
+MAX_CONTEXT_TOKENS = int(os.environ.get("MAX_CONTEXT_TOKENS", '200000'))
+DEFAULT_RECURSION_LIMIT = int(os.environ.get("DEFAULT_RECURSION_LIMIT", '20'))
+MAX_CONTEXT_MESSAGES =  int(os.environ.get("MAX_CONTEXT_MESSAGES", '10'))
+SUMMARIZATION_TRIGGER = float(os.environ.get("SUMMARIZATION_TRIGGER", '0.7'))
+SUMMARIZATION_KEEP = int(os.environ.get("SUMMARIZATION_KEEP", '3'))
+TEMPERATURE = float(os.environ.get('TEMPERATURE', '0.5'))
+
+tools_list = [
+    list_dir, 
+    read_file, 
+    write_file, 
+    create_dir, 
+    file_exists, 
+    dir_exists, 
+    delete_dir, 
+    delete_file, 
+    npm_install, 
+    npm_build, 
+    pwd,
+    search_codebase
+]
+
+agent = None
+
+# ===== 4. МОДЕЛЬ =====
+model = init_chat_model(
+    model="Qwen/Qwen3-Coder-Next",
+    base_url='https://foundation-models.api.cloud.ru/v1',
+    model_provider='openai',
+    temperature=TEMPERATURE,
+    timeout=120,
+    max_tokens=2500,
+    max_retries=3,
+    streaming=True
+)
+
+
+def summarize_old_messages_sync(messages, keep_last: int = None):
+    """
+    Синхронная версия суммаризации с вызовом LLM.
+    Возвращает НОВЫЙ список сообщений.
+    """
+    if keep_last is None:
+        keep_last = SUMMARIZATION_KEEP
+
+    if len(messages) <= keep_last + 1:
+        return messages
+
+    # Разделяем сообщения
+    system_msgs = [m for m in messages if isinstance(m, SystemMessage)]
+    other_msgs = [m for m in messages if not isinstance(m, SystemMessage)]
+
+    # === ЗАЩИТА: Не обрезаем незавершённые tool_calls ===
+    # Находим индексы сообщений с tool_calls в последних keep_last сообщениях
+    protected_indices = set()
+    for i, msg in enumerate(other_msgs[-keep_last:]):
+        if hasattr(msg, 'tool_calls') and msg.tool_calls:
+            # Это сообщение с tool_calls - нужно сохранить
+            protected_indices.add(len(other_msgs) - keep_last + i)
+    
+    # Увеличиваем keep_last, чтобы захватить все защищённые сообщения
+    if protected_indices:
+        min_protected = min(protected_indices)
+        if min_protected < len(other_msgs) - keep_last:
+            # Расширяем keep_last, чтобы включить это сообщение
+            new_keep_last = len(other_msgs) - min_protected
+            print(f"🛡️ Расширяю keep_last с {keep_last} до {new_keep_last} из-за незавершённых tool_calls")
+            keep_last = new_keep_last
+    
+    # Пересчитываем с новым keep_last
+    if len(messages) <= keep_last + 1:
+        return messages
+    
+    other_msgs = [m for m in messages if not isinstance(m, SystemMessage)]
+    to_summarize = other_msgs[:-keep_last]
+    to_keep = other_msgs[-keep_last:]
+
+    if not to_summarize:
+        return messages
+
+    # Формируем промпт для суммаризации
+    conversation_parts = []
+    for msg in to_summarize:
+        if isinstance(msg, HumanMessage):
+            role = "User"
+        elif isinstance(msg, AIMessage):
+            role = "Assistant"
+        else:
+            role = "System"
+
+        # Ограничиваем длину каждого сообщения для резюме
+        # content = msg.content[:500] if len(msg.content) > 500 else msg.content
+        content = msg.content
+        conversation_parts.append(f"{role}: {content}")
+
+    conversation_text = "\n".join(conversation_parts)
+    with open("./prompts/summary_prompt.txt", "r", encoding="utf-8") as f:
+        summary_prompt = f.read()
+    
+    prompt = f"""
+{summary_prompt}
+Диалог для сжатия:
+{conversation_text}
+
+Краткое резюме:
+"""
+
+    try:
+        response = model.invoke([HumanMessage(content=prompt)])
+        summary = response.content
+
+        if len(summary) > 2000:
+            summary = summary[:2000] + "..."
+
+        summary_message = SystemMessage(
+            content=f"КРАТКАЯ ИСТОРИЯ:\n{summary}"
+        )
+
+        new_messages = system_msgs + [summary_message] + to_keep
+
+        old_tokens = sum(count_tokens_approximately(msg.content) for msg in to_summarize if hasattr(msg, 'content'))
+        new_tokens = sum(count_tokens_approximately(msg.content) for msg in [summary_message] if hasattr(msg, 'content'))
+
+        print(f"📝 Суммаризировано {len(to_summarize)} сообщений")
+        print(f"   Сэкономлено токенов: ~{old_tokens - new_tokens:,} (было {old_tokens:,}, стало {new_tokens:,})")
+
+        return new_messages
+
+    except Exception as e:
+        print(f"⚠️ Ошибка суммаризации: {e}, применяю упрощённую обрезку")
+        summary = f"[Сжатая история из {len(to_summarize)} сообщений]"
+        for msg in to_summarize[-5:]:
+            role = "User" if isinstance(msg, HumanMessage) else "Assistant"
+            content = msg.content[:100] if len(msg.content) > 100 else msg.content
+            summary += f"\n{role}: {content}"
+
+        summary_message = SystemMessage(content=f"КРАТКАЯ ИСТОРИЯ:\n{summary[:1500]}")
+        return system_msgs + [summary_message] + to_keep
+
+
+def emergency_trim(messages):
+    """Экстренная обрезка при критическом переполнении с сохранением целостности"""
+    system_msgs = [m for m in messages if isinstance(m, SystemMessage)]
+    other_msgs = [m for m in messages if not isinstance(m, SystemMessage)]
+    
+    # Находим все ID инструментов, ожидающих ответа
+    pending_tool_calls = set()
+    tool_call_locations = {}  # индекс сообщения → список ID вызовов
+    
+    for i, msg in enumerate(other_msgs):
+        if hasattr(msg, 'tool_calls') and msg.tool_calls:
+            for tc in msg.tool_calls:
+                tool_call_id = tc.get('id')
+                pending_tool_calls.add(tool_call_id)
+                if i not in tool_call_locations:
+                    tool_call_locations[i] = []
+                tool_call_locations[i].append(tool_call_id)
+    
+    # Находим ID, которые уже имеют ToolMessage
+    completed_tool_calls = set()
+    for msg in other_msgs:
+        if hasattr(msg, 'tool_call_id') and msg.tool_call_id:
+            completed_tool_calls.add(msg.tool_call_id)
+    
+    # Ожидающие = вызванные, но не завершённые
+    waiting = pending_tool_calls - completed_tool_calls
+    
+    if waiting:
+        print(f"🛡️ Обнаружены незавершённые вызовы: {waiting}")
+        print("   Увеличиваю буфер для сохранения целостности...")
+        
+        # Находим самое раннее сообщение с ожидающим вызовом
+        min_index = len(other_msgs)
+        for idx in tool_call_locations:
+            for tc_id in tool_call_locations[idx]:
+                if tc_id in waiting:
+                    min_index = min(min_index, idx)
+        
+        # Расширяем keep_last, чтобы захватить это сообщение
+        keep_count = len(other_msgs) - min_index
+        if keep_count < 5:
+            keep_count = min(keep_count + 3, len(other_msgs))  # Добавляем запас
+        print(f"   Увеличено keep_count с 5 до {keep_count}")
+    else:
+        keep_count = 5
+    
+    # Берём последние keep_count сообщений
+    kept = other_msgs[-keep_count:] if len(other_msgs) > keep_count else other_msgs
+    new_messages = system_msgs + kept
+    
+    print(f"🚨 ЭКСТРЕННАЯ ОБРЕЗКА: {len(messages)} → {len(new_messages)} сообщений")
+    return {"messages": new_messages}
+
+
+def aggressive_trim(messages):
+    """Агрессивная обрезка через trim_messages"""
+    trimmed = trim_messages(
+        messages,
+        max_tokens=MAX_CONTEXT_TOKENS - 10000,
+        strategy="last",
+        token_counter=count_tokens_approximately,
+        include_system=True,
+        allow_partial=True,
+        start_on="human",
+    )
+
+    new_tokens = sum(count_tokens_approximately(msg.content) for msg in trimmed if hasattr(msg, 'content'))
+    print(f"📊 Токенов ПОСЛЕ обрезки: {new_tokens:,} / {MAX_CONTEXT_TOKENS:,} ({new_tokens / MAX_CONTEXT_TOKENS * 100:.1f}%)")
+    print(f"🧹 Сообщений: {len(messages)} → {len(trimmed)}")
+
+    return {"messages": trimmed}
+
+
+# ===== pre_model_hook (только для текущего вызова, НЕ сохраняет) =====
+def trim_history_by_tokens(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Обрезает или суммаризирует историю для ТЕКУЩЕГО вызова (без сохранения)"""
+    messages = state.get("messages", [])
+    if not messages:
+        return {}
+
+    total_tokens = sum(count_tokens_approximately(msg.content) for msg in messages if hasattr(msg, 'content'))
+    usage_percent = total_tokens / MAX_CONTEXT_TOKENS * 100
+
+    # Если сильно превышает — обрезаем для текущего вызова
+    if usage_percent > 95:
+        print(f"⚠️ КРИТИЧЕСКОЕ ПЕРЕПОЛНЕНИЕ! Контекст ({usage_percent:.1f}%). Обрезаю для текущего вызова...")
+        return emergency_trim(messages)
+
+    if usage_percent > SUMMARIZATION_TRIGGER * 100:
+        print(f"📝 СУМАРИЗАЦИЯ! Превышен порог ({usage_percent:.1f}%), делаю суммаризацию для текущего вызова...")
+        try:
+            new_messages = summarize_old_messages_sync(messages)
+            return {"messages": new_messages}
+        except Exception as e:
+            print(f"⚠️ Ошибка суммаризации: {e}")
+            return aggressive_trim(messages)
+
+    return {}  # Ничего не меняем
+
+
+# ===== cleanup_history (СОХРАНЯЕТ в checkpoint) =====
+async def cleanup_history(agent, config: Dict, checkpointer):
+    """
+    Периодически сжимает историю И СОХРАНЯЕТ в checkpoint.
+    Вызывается после каждого запроса.
+    """
+    state = await agent.aget_state(config)
+    if not state or not state.values:
+        return
+    
+    messages = state.values.get("messages", [])
+    if not messages:
+        return
+    
+    # Проверяем незавершённые вызовы
+    has_pending = False
+    for msg in messages[-5:]:
+        if msg and hasattr(msg, 'tool_calls') and msg.tool_calls:
+            has_pending = True
+            break
+    
+    if has_pending:
+        print("🛡️ Есть незавершённые tool_calls — откладываю сохранение")
+        return
+    
+    total_tokens = sum(count_tokens_approximately(msg.content) for msg in messages if hasattr(msg, 'content'))
+    usage_percent = total_tokens / MAX_CONTEXT_TOKENS * 100
+    
+    # Только если сильно превышает — сохраняем сжатую версию
+    if usage_percent <= 80:
+        return
+    
+    print(f"📊 Сохраняю сжатую историю в checkpoint ({usage_percent:.1f}% → ...)")
+    
+    # Выполняем суммаризацию
+    try:
+        new_messages = summarize_old_messages_sync(messages)
+        
+        if len(new_messages) < len(messages):
+            # Сохраняем в checkpoint
+            await agent.aupdate_state(
+                config,
+                {"messages": new_messages},
+                as_node="__start__"
+            )
+            print(f"💾 Checkpoint обновлён: {len(messages)} → {len(new_messages)} сообщений")
+        else:
+            print(f"⚠️ Суммаризация не уменьшила количество сообщений оставвим как есть")
+    except Exception as e:
+        print(f"⚠️ Ошибка при сохранении: {e}")
+
+
+# ===== 6. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
+def print_separator(char: str = "=", length: int = 60):
+    print(char * length)
+
+
+@retry(
+    retry=retry_if_exception_type((ConnectionError, httpx.RemoteProtocolError, asyncio.TimeoutError)),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=15),
+    reraise=True
+)
+async def stable_stream_response(agent, user_input: str, config: Dict):
+    """Стабильный стриминг с повторными попытками"""
+    full_response = ""
+
+    try:
+        async for event in agent.astream_events(
+                {"messages": [HumanMessage(content=user_input)]},
+                config=config,
+                version="v2"
+        ):
+            if event["event"] == "on_chat_model_stream":
+                chunk = event["data"]["chunk"]
+                if hasattr(chunk, 'content') and chunk.content:
+                    if full_response == "":
+                        print("💭 ", end="", flush=True)
+                    print(chunk.content, end="", flush=True)
+                    full_response += chunk.content
+
+        if full_response:
+            print("\n")
+        return full_response if full_response else "Ответ получен"
+
+    except Exception as e:
+        error_msg = str(e)
+        if "peer closed connection" in error_msg or "RemoteProtocolError" in error_msg:
+            print(f"\n⚠️ Соединение разорвано. Повторная попытка...")
+            raise asyncio.TimeoutError("Connection closed")
+        else:
+            print(f"\n❌ Ошибка: {error_msg}")
+            return None
+
+
+# ===== 7. ОСНОВНАЯ ФУНКЦИЯ =====
+async def run_agent():
+    print_separator("=", 70)
+    print("🚀 АГЕНТ Кодёр")
+    print(f"💾 Помнит последние {MAX_CONTEXT_MESSAGES} сообщений диалога")
+    print_separator("=", 70)
+
+    checkpoint_path = "checkpoints/agent_memory.sqlite"
+    os.makedirs("checkpoints", exist_ok=True)
+
+    session_config = {
+        "configurable": {"thread_id": "memory-session"},
+        "recursion_limit": DEFAULT_RECURSION_LIMIT
+    }
+
+    try:
+        async with aiosqlite.connect(checkpoint_path) as db:
+            checkpointer = AsyncSqliteSaver(db)
+            await checkpointer.setup()
+            
+            # загрузим промп из файла prompt.txt
+            with open("./prompts/instruction.txt", "r", encoding="utf-8") as f:
+                prompt = f.read()
+            
+            agent = create_react_agent(
+                model=model,
+                tools=tools_list,
+                checkpointer=checkpointer,
+                pre_model_hook=trim_history_by_tokens,
+                prompt=prompt
+            )
+
+            print("✅ Агент готов")
+            print("⌨️ Введите 'exit' для выхода")
+            print_separator("-", 70)
+
+            while True:
+                try:
+                    user_input = input("\n👤 User> ").strip()
+
+                    if not user_input:
+                        continue
+
+                    if user_input.lower() in ["exit", "quit"]:
+                        print("👋 До свидания!")
+                        break
+
+                    response = await asyncio.wait_for(
+                        stable_stream_response(agent, user_input, session_config),
+                        timeout=180
+                    )
+
+                    if not response:
+                        print("⚠️ Не удалось получить ответ")
+                    else:
+                        # После ответа проверяем и чистим историю
+                        await cleanup_history(agent, session_config, checkpointer)
+
+                except asyncio.TimeoutError:
+                    print("\n⚠️ Превышено время ожидания (180 сек)")
+                except KeyboardInterrupt:
+                    print("\n\n👋 Прервано пользователем")
+                    break
+                except Exception as e:
+                    print(f"\n❌ Ошибка: {str(e)}")
+
+    except Exception as e:
+        print(f"❌ Критическая ошибка: {str(e)}")
+        traceback.print_exc()
+        return 1
+
+    return 0

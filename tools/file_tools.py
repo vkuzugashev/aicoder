@@ -86,25 +86,28 @@ def list_dir(path: str = "") -> str:
         return f"❌ Ошибка при чтении директории: {str(e)}"
 
 @tool
-def create_dir(path: str) -> bool:
+def create_dir(path: str):
     """Создает директорию."""
     dir_path = _safe_path(path, WORK_DIR)
+    if dir_path.exists():
+        if dir_path.is_dir():
+            return f"❌ Директория уже существует: '{path}'"
     dir_path.mkdir(parents=True, exist_ok=True)
-    return True
+    return f'✅ Директория успешно создана'
 
 @tool
-def delete_dir(path: str) -> bool:
+def delete_dir(path: str):
     """Удаляет директорию."""
     dir_path = _safe_path(path, WORK_DIR)
     if not dir_path.exists():
-        return False
+        return f"❌ Директория не найдена: '{path}'"
     for item in dir_path.iterdir():
         if item.is_file():
             item.unlink()
         else:
             delete_dir(str(item.relative_to(WORK_DIR)))
     dir_path.rmdir()
-    return True
+    return f'✅ Директория успешно удалена'
 
 @tool
 # --- Функции для работы с файлами ---
@@ -117,7 +120,7 @@ def read_file(path: str, encoding: str = "utf-8") -> str:
         encoding="cp1251"
     
     # Проверяем существование файла
-    if not os.path.exists(file_path):
+    if not os.path.exists(file_path):        
         return f"❌ Файл не найден: '{path}'"
     
     if os.path.isdir(file_path):
@@ -130,7 +133,7 @@ def read_file(path: str, encoding: str = "utf-8") -> str:
         raise ValueError(f'Error read file: {file_path}, encoding: {encoding}, message: {e}') from e
 
 @tool
-def write_file(path: str, content: str, overwrite: bool = False) -> bool:
+def write_file(path: str, content: str, overwrite: bool = False):
     """
     Записывает файл в рабочую директорию.
     Если файл существует и overwrite=False — выбрасывает ошибку.
@@ -140,57 +143,74 @@ def write_file(path: str, content: str, overwrite: bool = False) -> bool:
 
     if file_path.exists() and not overwrite:
         return f"❌ Файл уже существует: '{path}'. Используй overwrite=True для перезаписи"
-
-    with open(file_path, "w", encoding="utf-8") as f:
-        f.write(content)
-    return True
+    try:
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(content)
+            print(f"📄 Файл записан: {path}")
+        return f'✅ Файл успешно записан'
+    except Exception as e:
+        return f"❌ Ошибка при записи файла: {str(e)}"
+    
+@tool
+def create_file(path: str):
+    """Создает файл. Ошибается, если файл уже есть."""
+    file_path = _safe_path(path, WORK_DIR)
+    if file_path.exists():
+        return f"❌ Файл уже существует: '{path}'."
+    try:
+        with os.open(file_path, os.O_CREAT) as f:
+            pass
+        print(f"📄 Файл создан: {path}")
+        return f'✅ Файл успешно создан'
+    except Exception as e:
+        return f"❌ Ошибка при создании файла: {str(e)}"
 
 @tool
-def create_file(path: str, content: str) -> bool:
-    """Создает файл с контентом. Ошибается, если файл уже есть."""
-    return write_file(path, content, overwrite=False)  # Явно запрещаем перезапись
-
-@tool
-def delete_file(path: str) -> bool:
+def delete_file(path: str):
     """Удаляет файл."""
     file_path = _safe_path(path, WORK_DIR)
     if file_path.exists():
-        file_path.unlink()
-        return True
-    return False
+        try:
+            file_path.unlink()
+            print(f"🗑️ Файл удалён: {path}")
+            return f'✅ Файл успешно удалён'
+        except Exception as e:
+            return f"❌ Ошибка при удалении файла: {str(e)}"
+    else:
+        return f"❌ Файл не найден: '{path}'"
 
 @tool
-def file_exists(path: str) -> bool:
+def file_exists(path: str):
     """
     Проверяет, существует ли файл.
     Возвращает True, если файл существует и это именно файл (не папка).
     """
-    try:
-        file_path = _safe_path(path, WORK_DIR)
-        return file_path.is_file()
-    except (PermissionError, ValueError):
-        return False
+    file_path = _safe_path(path, WORK_DIR)
+    if file_path.exists():
+        if file_path.is_file():
+            print(f"📄 Файл найден: {path}")
+            return f'✅ Файл существует'
+    
+    return f"❌ Файл не найден: '{path}'"
 
 @tool
-def dir_exists(path: str) -> bool:
+def dir_exists(path: str):
     """
     Проверяет, существует ли директория.
     Возвращает True, если путь указывает на существующую папку.
     """
-    try:
-        dir_path = _safe_path(path, WORK_DIR)
-        return dir_path.is_dir()
-    except (PermissionError, ValueError):
-        return False
+    dir_path = _safe_path(path, WORK_DIR)
+    if dir_path.exists():
+        if dir_path.is_dir():
+            print(f"📁 Директория найдена: {path}")
+            return f'✅ Директория существует'
+
+    return f"❌ Директория не найдена: '{path}'"
 
 @tool
 def pwd():
     """
     Получить путь к текущей рабочей директории
     """
-    try:        
-        # return os.getcwd()
-        return WORK_DIR
-    except Exception as e:
-        return f"Ошибка: {str(e)}"
+    return WORK_DIR
 

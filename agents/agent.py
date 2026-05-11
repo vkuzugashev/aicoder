@@ -1,6 +1,5 @@
 """
-Продвинутый AI агент для переписывания VB6 → NestJS + React
-Версия 3.0 с интеллектуальным управлением контекстом и суммаризацией
+Продвинутый AI агент с суммаризацией (исправленный)
 """
 import os
 import sys
@@ -21,7 +20,8 @@ from langchain_core.messages import (
 )
 from langchain_core.messages.utils import count_tokens_approximately
 
-# Добавляем корень проекта в путь
+from utils.token_counter import count_tokens_for_qwen
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import config
@@ -29,7 +29,6 @@ from agents.memory_manager import memory_manager
 from utils.summarizer import AdvancedSummarizer, SummarizationStrategy
 from utils.metrics import metrics
 
-# Инструменты
 from tools.code_base import search_codebase
 from tools.file_tools import (
     list_dir, read_file, write_file, create_dir, 
@@ -40,7 +39,6 @@ from tools.build_tools import npm_install, npm_build
 os.environ['CURL_CA_BUNDLE'] = ''
 os.environ['REQUESTS_CA_BUNDLE'] = ''
 
-# Логи только в файл
 import logging
 logging.basicConfig(
     level=logging.WARNING,
@@ -64,7 +62,7 @@ tools_list = [
     npm_install, npm_build, pwd, search_codebase
 ]
 
-# Инициализация модели
+# Модель
 try:
     api_key = config.API_KEY
     model = init_chat_model(
@@ -83,11 +81,10 @@ except Exception as e:
     print(f"❌ Ошибка модели: {e}")
     sys.exit(1)
 
-# Суммаризатор
 summarizer = AdvancedSummarizer(model)
 
 class AdvancedAgent:
-    """Продвинутый агент с суммаризацией"""
+    """Агент с суммаризацией (без ensure_future)"""
     
     def __init__(self):
         self.agent = None
@@ -102,6 +99,7 @@ class AdvancedAgent:
         self.max_context_seen = 0
         self.summarization_count = 0
         self.tokens_saved = 0
+        self.need_summarize = False  # Флаг для отложенной суммаризации
     
     async def initialize(self) -> bool:
         """Инициализация"""
@@ -113,20 +111,18 @@ class AdvancedAgent:
             self.checkpointer = AsyncSqliteSaver(self.db)
             await self.checkpointer.setup()
             
-            # Загружаем промпт
             try:
                 with open("./prompts/instruction.txt", "r", encoding="utf-8") as f:
                     system_prompt = f.read()
             except:
                 system_prompt = "Ты - AI ассистент для работы с кодом."
             
-            # Создаем агента с хуком суммаризации
+            # СОЗДАЕМ АГЕНТА БЕЗ pre_model_hook
             self.agent = create_react_agent(
                 model=model,
                 tools=tools_list,
                 checkpointer=self.checkpointer,
-                prompt=system_prompt,
-                pre_model_hook=self._summarization_hook  # Хук суммаризации
+                prompt=system_prompt
             )
             
             self.is_initialized = True
@@ -137,49 +133,109 @@ class AdvancedAgent:
             print(f"❌ Ошибка: {e}")
             return False
     
-    def _summarization_hook(self, state: Dict[str, Any]) -> Dict[str, Any]:
+    def _sync_check_context(self, messages: list) -> tuple:
         """
-        СИНХРОННЫЙ хук суммаризации.
-        Вызывается перед каждым запросом к модели.
+        СИНХРОННАЯ проверка контекста.
+        Возвращает (нужна_суммаризация, обрезанные_сообщения)
         """
-        messages = state.get("messages", [])
         if not messages:
-            return {}
+            return False, messages
         
-        # Считаем токены
+        # total_tokens = sum(
+        #     count_tokens_approximately(m.content) 
+        #     for m in messages 
+        #     if hasattr(m, 'content') and m.content
+        # )
+        
         total_tokens = sum(
-            count_tokens_approximately(m.content) 
+            count_tokens_for_qwen(m.content) 
             for m in messages 
             if hasattr(m, 'content') and m.content
         )
-        
+
         self.max_context_seen = max(self.max_context_seen, total_tokens)
         
-        # Проверяем, нужна ли суммаризация
-        SUMMARIZE_THRESHOLD = int(config.MAX_CONTEXT_TOKENS * config.SUMMARIZATION_TRIGGER)
-        CRITICAL_THRESHOLD = int(config.MAX_CONTEXT_TOKENS * config.CRITICAL_CONTEXT_USAGE)
+        threshold = int(config.MAX_CONTEXT_TOKENS * config.SUMMARIZATION_TRIGGER)
+        critical = int(config.MAX_CONTEXT_TOKENS * config.CRITICAL_CONTEXT_USAGE)
         
-        if total_tokens > SUMMARIZE_THRESHOLD:
-            # Нужна суммаризация или обрезка
-            
-            if total_tokens > CRITICAL_THRESHOLD:
-                # Критическое переполнение - экстренная обрезка
-                return self._emergency_sync_trim(messages, total_tokens)
-            else:
-                # Обычная суммаризация - запускаем асинхронно
-                asyncio.ensure_future(self._async_summarize_and_save(messages, total_tokens))
-                
-                # Пока делаем легкую обрезку для текущего запроса
-                return self._light_sync_trim(messages, total_tokens)
+        if total_tokens > critical:
+            # Критическое - экстренная обрезка
+            return "critical", self._emergency_trim(messages, total_tokens)
         
-        return {}
+        elif total_tokens > threshold:
+            # Нужна суммаризация (НО не здесь, а в асинхронном коде)
+            return "summarize", messages
+        
+        return None, messages
     
-    async def _async_summarize_and_save(self, messages: list, current_tokens: int):
-        """Асинхронная суммаризация и сохранение"""
+    def _emergency_trim(self, messages: list, total_tokens: int) -> list:
+        """Синхронная экстренная обрезка"""
+        system_msgs = [m for m in messages if isinstance(m, SystemMessage)]
+        protected = self._extract_protected(messages)
+        other = [m for m in messages if m not in protected and not isinstance(m, SystemMessage)]
+        kept = other[-5:] if len(other) > 5 else other
+        
+        result = system_msgs + protected + kept
+        
+        # new_tokens = sum(
+        #     count_tokens_approximately(m.content) 
+        #     for m in result 
+        #     if hasattr(m, 'content') and m.content
+        # )
+        
+        new_tokens = sum(
+            count_tokens_for_qwen(m.content) 
+            for m in result 
+            if hasattr(m, 'content') and m.content
+        )
+
+        print(f"\n🚨 Экстренная обрезка: {total_tokens:,} → {new_tokens:,} токенов")
+        print(f"   Сообщений: {len(messages)} → {len(result)}")
+        
+        return result
+    
+    def _extract_protected(self, messages: list) -> list:
+        """Защищенные tool chains"""
+        protected = []
+        indices = set()
+        
+        for i, msg in enumerate(messages):
+            if i in indices:
+                continue
+            if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                protected.append(msg)
+                indices.add(i)
+                for tc in msg.tool_calls:
+                    tc_id = tc.get('id') if isinstance(tc, dict) else getattr(tc, 'id', None)
+                    if tc_id:
+                        for j in range(i + 1, min(i + 10, len(messages))):
+                            if j in indices:
+                                continue
+                            m = messages[j]
+                            if isinstance(m, ToolMessage) and hasattr(m, 'tool_call_id') and m.tool_call_id == tc_id:
+                                protected.append(m)
+                                indices.add(j)
+        return protected
+    
+    async def _do_summarization(self):
+        """Асинхронная суммаризация (вызывается в правильном event loop)"""
         try:
-            print(f"\n📝 Суммаризация: {current_tokens:,} токенов → ", end="", flush=True)
+            state = await self.agent.aget_state(self.session_config)
+            if not state or not state.values:
+                return
             
-            # Запускаем суммаризацию
+            messages = state.values.get("messages", [])
+            if not messages:
+                return
+            
+            total_tokens = sum(
+                count_tokens_approximately(m.content) 
+                for m in messages 
+                if hasattr(m, 'content') and m.content
+            )
+            
+            print(f"\n📝 Суммаризация: {total_tokens:,} токенов → ", end="", flush=True)
+            
             summarized, saved = await summarizer.summarize(
                 messages,
                 preserve_tools=True
@@ -191,9 +247,8 @@ class AdvancedAgent:
                 if hasattr(m, 'content') and m.content
             )
             
-            print(f"{new_tokens:,} токенов (сэкономлено {saved:,})")
+            print(f"{new_tokens:,} (экономия {saved:,})")
             
-            # Сохраняем в чекпоинт
             await self.agent.aupdate_state(
                 self.session_config,
                 {"messages": summarized},
@@ -202,85 +257,10 @@ class AdvancedAgent:
             
             self.summarization_count += 1
             self.tokens_saved += saved
-            
-            logger.info(f"Суммаризация #{self.summarization_count}: {current_tokens:,} → {new_tokens:,} токенов")
+            self.need_summarize = False
             
         except Exception as e:
             logger.error(f"Ошибка суммаризации: {e}")
-    
-    def _emergency_sync_trim(self, messages: list, total_tokens: int) -> Dict:
-        """Экстренная синхронная обрезка"""
-        system_msgs = [m for m in messages if isinstance(m, SystemMessage)]
-        
-        # Защищаем tool chains
-        protected = self._extract_protected(messages)
-        
-        # Остальные
-        other = [m for m in messages if m not in protected and not isinstance(m, SystemMessage)]
-        
-        # Оставляем минимум
-        kept = other[-3:] if len(other) > 3 else other
-        
-        new_messages = system_msgs + protected + kept
-        
-        new_tokens = sum(
-            count_tokens_approximately(m.content) 
-            for m in new_messages 
-            if hasattr(m, 'content') and m.content
-        )
-        
-        print(f"\n🚨 ЭКСТРЕННАЯ ОБРЕЗКА: {total_tokens:,} → {new_tokens:,} токенов")
-        print(f"   Сообщений: {len(messages)} → {len(new_messages)}")
-        
-        return {"messages": new_messages}
-    
-    def _light_sync_trim(self, messages: list, total_tokens: int) -> Dict:
-        """Легкая синхронная обрезка"""
-        system_msgs = [m for m in messages if isinstance(m, SystemMessage)]
-        protected = self._extract_protected(messages)
-        other = [m for m in messages if m not in protected and not isinstance(m, SystemMessage)]
-        
-        kept = other[-10:] if len(other) > 10 else other
-        
-        new_messages = system_msgs + protected + kept
-        
-        new_tokens = sum(
-            count_tokens_approximately(m.content) 
-            for m in new_messages 
-            if hasattr(m, 'content') and m.content
-        )
-        
-        if new_tokens < total_tokens:
-            print(f"\n✂️ Легкая обрезка: {total_tokens:,} → {new_tokens:,} токенов")
-        
-        return {"messages": new_messages}
-    
-    def _extract_protected(self, messages: list) -> list:
-        """Извлекает защищенные tool chains"""
-        protected = []
-        protected_indices = set()
-        
-        for i, msg in enumerate(messages):
-            if i in protected_indices:
-                continue
-            
-            if hasattr(msg, 'tool_calls') and msg.tool_calls:
-                protected.append(msg)
-                protected_indices.add(i)
-                
-                # Ищем связанные ToolMessage
-                for tc in msg.tool_calls:
-                    tc_id = tc.get('id') if isinstance(tc, dict) else getattr(tc, 'id', None)
-                    if tc_id:
-                        for j in range(i + 1, min(i + 10, len(messages))):
-                            if j in protected_indices:
-                                continue
-                            m = messages[j]
-                            if isinstance(m, ToolMessage) and hasattr(m, 'tool_call_id') and m.tool_call_id == tc_id:
-                                protected.append(m)
-                                protected_indices.add(j)
-        
-        return protected
     
     async def process_request(self, user_input: str) -> Optional[str]:
         """Обработка запроса"""
@@ -291,9 +271,32 @@ class AdvancedAgent:
         
         self.total_requests += 1
         
-        # Проверяем контекст и делаем суммаризацию если нужно
-        await self._check_and_summarize()
+        # 1. Проверяем контекст ДО запроса
+        action = None
+        try:
+            state = await self.agent.aget_state(self.session_config)
+            if state and state.values:
+                messages = state.values.get("messages", [])
+                action, new_messages = self._sync_check_context(messages)
+                
+                if action == "critical":
+                    # Сохраняем обрезанные сообщения
+                    await self.agent.aupdate_state(
+                        self.session_config,
+                        {"messages": new_messages},
+                        as_node="__start__"
+                    )
+                elif action == "summarize":
+                    # Запускаем суммаризацию
+                    await self._do_summarization()
+        except Exception as e:
+            logger.error(f"Ошибка проверки контекста: {e}")
         
+        # 2. Периодическая суммаризация (каждые 5 запросов)
+        if self.total_requests % 5 == 0:
+            await self._do_summarization()
+        
+        # 3. Обрабатываем запрос
         try:
             full_response = ""
             
@@ -316,8 +319,8 @@ class AdvancedAgent:
                 
                 elif kind == "on_tool_start":
                     tool_name = event.get("name", "unknown")
-                    short_name = tool_name.replace("_tool", "").replace("_", " ")
-                    print(f"\n🔧 {short_name}...", end="", flush=True)
+                    short = tool_name.replace("_tool", "").replace("_", " ")
+                    print(f"\n🔧 {short}...", end="", flush=True)
                 
                 elif kind == "on_tool_end":
                     output = str(event.get("data", {}).get("output", ""))
@@ -330,13 +333,7 @@ class AdvancedAgent:
             
             if full_response:
                 print("\n")
-                
-                memory_manager.add_interaction(
-                    user_msg=user_input,
-                    ai_msg=full_response,
-                    metadata={'request_num': self.total_requests}
-                )
-                
+                memory_manager.add_interaction(user_msg=user_input, ai_msg=full_response)
                 return full_response
             else:
                 print("\n⚠️ Пустой ответ")
@@ -346,96 +343,14 @@ class AdvancedAgent:
             error_str = str(e)
             
             if "maximum context length" in error_str:
-                print(f"\n⚠️ Контекст переполнен! Экстренная очистка...")
-                await self._emergency_summarize()
+                print(f"\n⚠️ Контекст переполнен!")
+                await self._do_summarization()
                 print("🔄 Повторите запрос")
                 return None
             
             logger.error(f"Ошибка: {e}")
             print(f"\n❌ {str(e)[:200]}")
             return None
-    
-    async def _check_and_summarize(self):
-        """Проверка контекста и суммаризация при необходимости"""
-        try:
-            state = await self.agent.aget_state(self.session_config)
-            if not state or not state.values:
-                return
-            
-            messages = state.values.get("messages", [])
-            if not messages:
-                return
-            
-            total_tokens = sum(
-                count_tokens_approximately(m.content) 
-                for m in messages 
-                if hasattr(m, 'content') and m.content
-            )
-            
-            threshold = int(config.MAX_CONTEXT_TOKENS * config.SUMMARIZATION_TRIGGER)
-            
-            if total_tokens > threshold:
-                print(f"\n📝 Авто-суммаризация: {total_tokens:,} токенов...", end="", flush=True)
-                
-                summarized, saved = await summarizer.summarize(
-                    messages,
-                    preserve_tools=True
-                )
-                
-                new_tokens = sum(
-                    count_tokens_approximately(m.content) 
-                    for m in summarized 
-                    if hasattr(m, 'content') and m.content
-                )
-                
-                print(f" → {new_tokens:,} токенов (экономия {saved:,})")
-                
-                await self.agent.aupdate_state(
-                    self.session_config,
-                    {"messages": summarized},
-                    as_node="__start__"
-                )
-                
-                self.summarization_count += 1
-                self.tokens_saved += saved
-                
-        except Exception as e:
-            logger.error(f"Ошибка проверки: {e}")
-    
-    async def _emergency_summarize(self):
-        """Экстренная суммаризация"""
-        try:
-            state = await self.agent.aget_state(self.session_config)
-            if not state or not state.values:
-                return
-            
-            messages = state.values.get("messages", [])
-            
-            # Максимально сжимаем
-            summarized, saved = await summarizer.summarize(
-                messages,
-                strategy=SummarizationStrategy.EXTRACTIVE,
-                preserve_tools=True
-            )
-            
-            await self.agent.aupdate_state(
-                self.session_config,
-                {"messages": summarized},
-                as_node="__start__"
-            )
-            
-            print(f"✅ Экстренная суммаризация: экономия {saved:,} токенов")
-            
-        except Exception as e:
-            logger.error(f"Ошибка экстренной суммаризации: {e}")
-            # Удаляем чекпоинт
-            try:
-                path = config.CHECKPOINT_DIR / "agent_memory.sqlite"
-                if path.exists():
-                    path.unlink()
-                    print("⚠️ Чекпоинт удален")
-            except:
-                pass
     
     async def close(self):
         if self.db:
@@ -449,8 +364,7 @@ async def run_advanced_agent():
     print(f"📋 VB6 → NestJS + React")
     print(f"🔗 {config.MODEL_NAME}")
     print(f"💾 Контекст: до {config.MAX_CONTEXT_TOKENS:,} токенов")
-    print(f"🗜️ Суммаризация: при {config.SUMMARIZATION_TRIGGER*100:.0f}% заполнения")
-    print(f"🛡️ Крит. обрезка: при {config.CRITICAL_CONTEXT_USAGE*100:.0f}%")
+    print(f"🗜️ Суммаризация: при {config.SUMMARIZATION_TRIGGER*100:.0f}%")
     print("=" * 70)
     
     agent = AdvancedAgent()
@@ -460,7 +374,7 @@ async def run_advanced_agent():
             return 1
         
         print("✅ Агент готов")
-        print("📝 Команды: exit | summarize | stats | help")
+        print("📝 exit | summarize | stats | help")
         print("-" * 70)
         
         while True:
@@ -477,8 +391,7 @@ async def run_advanced_agent():
                     break
                 
                 elif user_input.lower() == "summarize":
-                    print("📝 Принудительная суммаризация...")
-                    await agent._emergency_summarize()
+                    await agent._do_summarization()
                     continue
                 
                 elif user_input.lower() == "stats":
@@ -487,13 +400,12 @@ async def run_advanced_agent():
                     print(f"   Суммаризаций: {agent.summarization_count}")
                     print(f"   Сэкономлено: {agent.tokens_saved:,} токенов")
                     print(f"   Пик контекста: {agent.max_context_seen:,} токенов")
-                    print(f"   Память: {len(memory_manager.working_memory)} раб. / {len(memory_manager.episodic_memory)} эпизод.")
                     continue
                 
                 elif user_input.lower() == "help":
                     print("\n📚 КОМАНДЫ:")
                     print("   exit      - выход")
-                    print("   summarize - принудительная суммаризация")
+                    print("   summarize - суммаризация сейчас")
                     print("   stats     - статистика")
                     print("   help      - справка")
                     continue
@@ -501,7 +413,7 @@ async def run_advanced_agent():
                 await agent.process_request(user_input)
                 
             except KeyboardInterrupt:
-                print(f"\n\n👋 Прервано. Суммаризаций: {agent.summarization_count}")
+                print(f"\n\n👋 Прервано")
                 break
             except Exception as e:
                 print(f"\n❌ {e}")

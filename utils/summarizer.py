@@ -14,6 +14,8 @@ from langchain_core.messages.utils import count_tokens_approximately
 from langchain_core.language_models import BaseChatModel
 
 import sys
+
+from utils.token_counter import count_tokens_for_qwen
 sys.path.append('..')
 from config import config
 
@@ -38,7 +40,8 @@ class AdvancedSummarizer:
             return SummarizationStrategy.EXTRACTIVE
         
         # Анализируем характеристики
-        total_tokens = sum(count_tokens_approximately(m.content) for m in messages if hasattr(m, 'content'))
+        # total_tokens = sum(count_tokens_approximately(m.content) for m in messages if hasattr(m, 'content'))
+        total_tokens = sum(count_tokens_for_qwen(m.content) for m in messages if hasattr(m, 'content'))
         avg_tokens_per_msg = total_tokens / len(messages) if messages else 0
         has_tool_calls = any(hasattr(m, 'tool_calls') and m.tool_calls for m in messages)
         has_code = any('```' in (m.content or '') for m in messages)

@@ -67,6 +67,8 @@ def list_dir(path: str = "") -> str:
     if not os.path.isdir(dir_path):
         return f"❌ Путь не является директорией: '{path}'"
     
+    print(f"📁 Список папок и файлов в: {path}")
+    
     try:
         items = []
         for name in os.listdir(dir_path):
@@ -93,7 +95,7 @@ def create_dir(path: str):
         if dir_path.is_dir():
             return f"❌ Директория уже существует: '{path}'"
     dir_path.mkdir(parents=True, exist_ok=True)
-    return f'✅ Директория успешно создана'
+    return f'✅ Директория успешно создана: {dir_path}'
 
 @tool
 def delete_dir(path: str):
@@ -107,7 +109,7 @@ def delete_dir(path: str):
         else:
             delete_dir(str(item.relative_to(WORK_DIR)))
     dir_path.rmdir()
-    return f'✅ Директория успешно удалена'
+    return f'✅ Директория успешно удалена {dir_path}'
 
 @tool
 # --- Функции для работы с файлами ---
@@ -126,6 +128,7 @@ def read_file(path: str, encoding: str = "utf-8") -> str:
     if os.path.isdir(file_path):
         return f"❌ Путь является директорией, а не файлом: '{path}'"    
     
+    print (f"📄 Чтение файла: {path}")
     try:
         with open(file_path, mode, encoding=encoding) as f:
             return f.read()
@@ -143,6 +146,8 @@ def write_file(path: str, content: str, overwrite: bool = False):
 
     if file_path.exists() and not overwrite:
         return f"❌ Файл уже существует: '{path}'. Используй overwrite=True для перезаписи"
+    
+    print(f"📄 Запись файла: {path}")
     try:
         with open(file_path, "w", encoding="utf-8") as f:
             f.write(content)

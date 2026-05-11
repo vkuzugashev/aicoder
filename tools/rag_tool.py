@@ -1,46 +1,63 @@
-"""RAG хранилище с ChromaDB"""
+"""RAG хранилище с визуальной индексацией"""
 import os
+import sys
 from pathlib import Path
 from typing import List, Optional
+from datetime import datetime
+from collections import defaultdict
+
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import TextLoader
 from langchain_core.documents import Document
 
-import sys
+# Фиксированный импорт
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import config
 
 class RAGStore:
     def __init__(self):
+        print(f"📚 Инициализация RAG...")
+        
         self.embeddings = HuggingFaceEmbeddings(
             model_name="sentence-transformers/all-MiniLM-L6-v2",
             cache_folder="./embeddings_cache"
         )
+        
         self.vectorstore: Optional[Chroma] = None
+        self.stats = {
+            'total_files': 0,
+            'total_chunks': 0,
+            'file_types': defaultdict(int)
+        }
+        
         self._init_store()
+        print(f"✅ RAG готов\n")
     
     def _init_store(self):
         if config.CHROMA_DIR.exists() and list(config.CHROMA_DIR.iterdir()):
-            self.vectorstore = Chroma(
-                embedding_function=self.embeddings,
-                persist_directory=str(config.CHROMA_DIR)
-            )
             try:
+                self.vectorstore = Chroma(
+                    embedding_function=self.embeddings,
+                    persist_directory=str(config.CHROMA_DIR)
+                )
                 count = self.vectorstore._collection.count()
-                print(f"📚 RAG загружен: {count} документов")
+                print(f"   Загружено: {count:,} документов")
             except:
-                print("📚 RAG загружен")
+                self.vectorstore = Chroma(
+                    embedding_function=self.embeddings,
+                    persist_directory=str(config.CHROMA_DIR)
+                )
         else:
             self.vectorstore = Chroma(
                 embedding_function=self.embeddings,
                 persist_directory=str(config.CHROMA_DIR)
             )
-            print("📚 RAG создан (пустой)")
+            print(f"   Создано новое хранилище")
     
     def index_directory(self, directory: str):
-        """Индексация директории с визуализацией"""
+        """Индексация с визуализацией"""
         docs = []
         path = Path(directory)
         
@@ -72,14 +89,12 @@ class RAGStore:
         errors = 0
         
         for i, file_path in enumerate(files_to_index):
-            # Прогресс-бар
             percent = (i + 1) / len(files_to_index) * 100
             bar_len = 30
             filled = int(bar_len * (i + 1) / len(files_to_index))
             bar = '█' * filled + '░' * (bar_len - filled)
             
-            print(f"\r   [{bar}] {percent:5.1f}%  {i+1}/{len(files_to_index)}  "
-                f"✅{i+1-errors} ❌{errors}", end="", flush=True)
+            print(f"\r   [{bar}] {percent:5.1f}%  {i+1}/{len(files_to_index)}  ✅{i+1-errors} ❌{errors}", end="", flush=True)
             
             try:
                 encoding = 'cp1251' if file_path.suffix.lower() in {'.frm', '.bas', '.cls', '.vb'} else 'utf-8'
@@ -91,45 +106,43 @@ class RAGStore:
             except Exception:
                 errors += 1
         
-        print()  # Новая строка после прогресс-бара
+        print()
         
         if not docs:
             print("⚠️ Нет документов для индексации")
             return
         
-        # Этап 3: Разбиение на чанки с прогресс-баром
+        # Этап 3: Разбиение на чанки
         print(f"\n🧩 Разбиение на чанки...")
         
+        # ИСПОЛЬЗУЕМ config.CHUNK_SIZE и config.CHUNK_OVERLAP
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=config.CHUNK_SIZE,
             chunk_overlap=config.CHUNK_OVERLAP
         )
         
         chunks = splitter.split_documents(docs)
+        print(f"   Создано: {len(chunks)} чанков")
         
-        # Прогресс-бар для чанков
-        bar_filled = 30
-        bar = '█' * bar_filled
-        print(f"   [{bar}] 100.0%  {len(chunks)} чанков создано")
-        
-        # Этап 4: Сохранение с прогресс-баром
+        # Этап 4: Сохранение
         print(f"\n💾 Сохранение в хранилище:")
         
         batch_size = 500
+        total_batches = (len(chunks) + batch_size - 1) // batch_size
+        
         for i in range(0, len(chunks), batch_size):
             batch = chunks[i:i+batch_size]
             batch_num = i // batch_size + 1
-            total_batches = (len(chunks) + batch_size - 1) // batch_size
             
             percent = batch_num / total_batches * 100
-            filled = int(bar_len * batch_num / total_batches)
-            bar = '█' * filled + '░' * (bar_len - filled)
+            filled = int(30 * batch_num / total_batches)
+            bar = '█' * filled + '░' * (30 - filled)
             
             print(f"\r   [{bar}] {percent:5.1f}%  пакет {batch_num}/{total_batches}", end="", flush=True)
             
             self.vectorstore.add_documents(batch)
         
-        print()  # Новая строка
+        print()
         
         # Итог
         print(f"\n{'='*50}")
@@ -140,21 +153,22 @@ class RAGStore:
         print(f"   🧩 Чанков:       {len(chunks)}")
         print(f"   ❌ Ошибок:       {errors}")
         print(f"{'='*50}\n")
+        
+        self.stats['total_files'] = len(files_to_index)
+        self.stats['total_chunks'] = len(chunks)
     
     def search(self, query: str, k: int = None) -> List[Document]:
-        """Поиск по хранилищу"""
+        """Поиск"""
         if k is None:
             k = config.RAG_TOP_K
         if not self.vectorstore:
             return []
         
-        retriever = self.vectorstore.as_retriever(
-            search_kwargs={"k": k}
-        )
+        retriever = self.vectorstore.as_retriever(search_kwargs={"k": k})
         return retriever.invoke(query)
     
     def search_formatted(self, query: str) -> str:
-        """Поиск с форматированием"""
+        """Форматированный поиск"""
         docs = self.search(query)
         if not docs:
             return "Ничего не найдено"
@@ -165,26 +179,25 @@ class RAGStore:
             parts.append(f"📁 {src}:\n{doc.page_content[:500]}")
         
         return "\n\n---\n\n".join(parts)
-
-
+    
     def has_source(self, directory: str) -> bool:
-        """Проверяет, есть ли в хранилище файлы из указанной директории"""
+        """Проверка наличия файлов из директории"""
         if not self.vectorstore:
             return False
         
         try:
-            # Простой поиск по расширениям VB6
-            test_docs = self.search("VB6", k=10)
+            count = self.vectorstore._collection.count()
+            if count == 0:
+                return False
+            
+            test_docs = self.search("frm bas cls vb6", k=5)
             for doc in test_docs:
                 source = doc.metadata.get('source', '')
-                if directory in source or any(
-                    source.endswith(ext) for ext in ['.frm', '.bas', '.cls', '.vb']
-                ):
+                if '.frm' in source or '.bas' in source or '.cls' in source:
                     return True
             return False
         except:
             return False
-
 
 # Глобальный экземпляр
 rag_store = RAGStore()

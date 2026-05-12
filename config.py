@@ -20,6 +20,8 @@ class Config:
     MAX_CONTEXT = int(os.getenv("MAX_CONTEXT_TOKENS", "262144"))
     SUMMARIZE_AT = 80000
     CRITICAL_AT = 200000
+
+    KEEP_LAST_MESSAGES = 10
     
     # RAG
     RAG_TOP_K = int(os.getenv("RAG_TOP_K", "10"))

@@ -1,46 +1,75 @@
-"""RAG хранилище с ChromaDB"""
+"""
+ЕДИНОЕ RAG ХРАНИЛИЩЕ
+ChromaDB для кода + истории диалога + решений
+"""
 import os
+import sys
+import time
+import asyncio
 from pathlib import Path
 from typing import List, Optional
-from langchain_chroma import Chroma
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import TextLoader
-from langchain_core.documents import Document
+from datetime import datetime
 
-import sys
+from langchain_chroma import Chroma
+from langchain_community.document_loaders import TextLoader
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_core.documents import Document
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import config
 
 class RAGStore:
+    """Единое хранилище: код VB6 + история диалога + решения"""
+    
     def __init__(self):
         self.embeddings = HuggingFaceEmbeddings(
             model_name="sentence-transformers/all-MiniLM-L6-v2",
             cache_folder="./embeddings_cache"
         )
-        self.vectorstore: Optional[Chroma] = None
-        self._init_store()
+        
+        # Отдельные коллекции для кода и истории
+        self.code_store: Optional[Chroma] = None
+        self.memory_store: Optional[Chroma] = None
+        
+        self._init_stores()
     
-    def _init_store(self):
-        if config.CHROMA_DIR.exists() and list(config.CHROMA_DIR.iterdir()):
-            self.vectorstore = Chroma(
-                embedding_function=self.embeddings,
-                persist_directory=str(config.CHROMA_DIR)
-            )
-            try:
-                count = self.vectorstore._collection.count()
-                print(f"📚 RAG загружен: {count} документов")
-            except:
-                print("📚 RAG загружен")
-        else:
-            self.vectorstore = Chroma(
-                embedding_function=self.embeddings,
-                persist_directory=str(config.CHROMA_DIR)
-            )
-            print("📚 RAG создан (пустой)")
+    def _init_stores(self):
+        """Инициализация ChromaDB коллекций"""
+        code_dir = config.CHROMA_DIR / "code"
+        memory_dir = config.CHROMA_DIR / "memory"
+        
+        code_dir.mkdir(parents=True, exist_ok=True)
+        memory_dir.mkdir(parents=True, exist_ok=True)
+        
+        self.code_store = Chroma(
+            embedding_function=self.embeddings,
+            persist_directory=str(code_dir)
+        )
+        
+        self.memory_store = Chroma(
+            embedding_function=self.embeddings,
+            persist_directory=str(memory_dir)
+        )
+        
+        # Статистика
+        try:
+            code_count = self.code_store._collection.count()
+            mem_count = self.memory_store._collection.count()
+            print(f"📚 RAG: {code_count} документов кода, {mem_count} записей истории")
+        except:
+            pass
     
+    # ===== ДЛЯ КОДА =====
     def index_directory(self, directory: str):
-        """Индексация директории с визуализацией"""
+        """Индексация с проверкой на повтор"""
+    
+        # ✅ Проверяем, не проиндексирована ли уже эта директория
+        if self._is_indexed(directory):
+            print(f"📚 Директория уже проиндексирована: {directory}")
+            return
+        
         docs = []
         path = Path(directory)
         
@@ -56,7 +85,7 @@ class RAGStore:
             if file_path.is_file() and file_path.suffix.lower() in {
                 '.py', '.js', '.ts', '.jsx', '.tsx', '.vue',
                 '.html', '.css', '.json', '.md',
-                '.vb', '.frm', '.bas', '.cls', '.frx'
+                '.vb', '.frm', '.bas', '.cls'
             }:
                 if not any(d in file_path.parts for d in {'.git', 'node_modules', '__pycache__', 'dist', 'build'}):
                     files_to_index.append(file_path)
@@ -127,7 +156,7 @@ class RAGStore:
             
             print(f"\r   [{bar}] {percent:5.1f}%  пакет {batch_num}/{total_batches}", end="", flush=True)
             
-            self.vectorstore.add_documents(batch)
+            self.code_store.add_documents(batch)
         
         print()  # Новая строка
         
@@ -141,50 +170,152 @@ class RAGStore:
         print(f"   ❌ Ошибок:       {errors}")
         print(f"{'='*50}\n")
     
-    def search(self, query: str, k: int = None) -> List[Document]:
-        """Поиск по хранилищу"""
-        if k is None:
-            k = config.RAG_TOP_K
-        if not self.vectorstore:
-            return []
-        
-        retriever = self.vectorstore.as_retriever(
-            search_kwargs={"k": k}
-        )
-        return retriever.invoke(query)
-    
-    def search_formatted(self, query: str) -> str:
-        """Поиск с форматированием"""
-        docs = self.search(query)
-        if not docs:
-            return "Ничего не найдено"
-        
-        parts = []
-        for doc in docs:
-            src = doc.metadata.get('source', 'unknown')
-            parts.append(f"📁 {src}:\n{doc.page_content[:500]}")
-        
-        return "\n\n---\n\n".join(parts)
-
-
-    def has_source(self, directory: str) -> bool:
-        """Проверяет, есть ли в хранилище файлы из указанной директории"""
-        if not self.vectorstore:
+    def _is_indexed(self, directory: str) -> bool:
+        """Проверяет, есть ли файлы из директории в RAG"""
+        if not self.code_store:
             return False
         
         try:
-            # Простой поиск по расширениям VB6
-            test_docs = self.search("VB6", k=10)
-            for doc in test_docs:
-                source = doc.metadata.get('source', '')
+            # Ищем любой файл из этой директории
+            results = self.code_store.similarity_search(
+                directory, k=1
+            )
+            
+            if results:
+                source = results[0].metadata.get('source', '')
+                # Проверяем что файл из той же директории
                 if directory in source or any(
-                    source.endswith(ext) for ext in ['.frm', '.bas', '.cls', '.vb']
+                    source.endswith(ext) for ext in ['.frm', '.bas', '.cls']
                 ):
                     return True
+            
             return False
         except:
             return False
 
+    def _mark_indexed(self, directory: str):
+        """Сохраняет отметку об индексации (опционально)"""
+        # Можно сохранить в отдельную коллекцию или файл
+        pass
 
-# Глобальный экземпляр
-rag_store = RAGStore()
+
+    def search_code(self, query: str, k: int = 5) -> str:
+        """Поиск по коду"""
+        docs = self.code_store.similarity_search(query, k=k)
+        if not docs:
+            return "Ничего не найдено в коде"
+        
+        return "\n\n".join([
+            f"📁 {d.metadata.get('source', '?')}:\n{d.page_content[:500]}"
+            for d in docs
+        ])    
+
+    # ===== ДЛЯ ИСТОРИИ ДИАЛОГА =====
+    
+    def add_message(self, msg: BaseMessage, importance: float = 0.5):
+        """Добавляет сообщение в историю"""
+        content = msg.content if hasattr(msg, 'content') else str(msg)
+        if not content or len(content) < 10:
+            return
+        
+        role = 'user' if isinstance(msg, HumanMessage) else 'assistant'
+        
+        doc = Document(
+            page_content=content[:2000],
+            metadata={
+                'type': 'message',
+                'role': role,
+                'importance': importance,
+                'timestamp': time.time(),
+                'is_decision': importance > 0.7
+            }
+        )
+        
+        self.memory_store.add_documents([doc])
+    
+    def add_decision(self, text: str):
+        """Добавляет важное решение"""
+        doc = Document(
+            page_content=f"✅ РЕШЕНИЕ: {text[:1000]}",
+            metadata={
+                'type': 'decision',
+                'importance': 1.0,
+                'timestamp': time.time(),
+                'is_decision': True
+            }
+        )
+        self.memory_store.add_documents([doc])
+    
+    def search_memory(self, query: str, k: int = 10) -> str:
+        """Поиск по истории диалога"""
+        docs = self.memory_store.similarity_search(query, k=k)
+        if not docs:
+            return "История пуста"
+        
+        results = []
+        for doc in docs:
+            role = doc.metadata.get('role', '?')
+            prefix = '👤' if role == 'user' else '🤖'
+            results.append(f"{prefix} {doc.page_content[:300]}")
+        
+        return "\n\n".join(results)
+    
+    def get_decisions(self, limit: int = 15) -> str:
+        """Получает последние важные решения"""
+        # Ищем документы с is_decision=True
+        docs = self.memory_store.similarity_search(
+            "решение создание файла прогресс",  # Общий запрос для решений
+            k=limit,
+            filter={"is_decision": True}
+        )
+        
+        if not docs:
+            # Если нет с фильтром — ищем все
+            docs = self.memory_store.similarity_search(
+                "важное решение создан файл модуль",
+                k=limit
+            )
+        
+        if not docs:
+            return "Нет записей о решениях"
+        
+        # Сортируем по времени
+        docs.sort(key=lambda d: d.metadata.get('timestamp', 0), reverse=True)
+        
+        return "\n".join([
+            f"{doc.page_content[:300]}"
+            for doc in docs[:limit]
+        ])
+    
+    def get_recent_context(self, query: str, limit: int = 10) -> str:
+        """Получает релевантный контекст: код + история"""
+        code_docs = self.code_store.similarity_search(query, k=3)
+        mem_docs = self.memory_store.similarity_search(query, k=5)
+        
+        parts = []
+        
+        if code_docs:
+            parts.append("📁 КОД:\n" + "\n".join([
+                f"  {d.metadata.get('source', '?')}: {d.page_content[:200]}"
+                for d in code_docs
+            ]))
+        
+        if mem_docs:
+            parts.append("🧠 ИСТОРИЯ:\n" + "\n".join([
+                f"  {d.page_content[:200]}"
+                for d in mem_docs
+            ]))
+        
+        return "\n\n".join(parts) if parts else "Ничего не найдено"
+    
+    def get_stats(self) -> dict:
+        try:
+            return {
+                'code_docs': self.code_store._collection.count(),
+                'memory_docs': self.memory_store._collection.count()
+            }
+        except:
+            return {'code_docs': 0, 'memory_docs': 0}
+
+# Глобальное хранилище
+rag = RAGStore()

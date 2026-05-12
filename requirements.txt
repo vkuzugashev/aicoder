@@ -9,3 +9,5 @@ langchain_text_splitters==1.1.2
 langgraph==1.1.10
 python-dotenv==1.2.2
 tenacity==9.1.4
+scikit-learn 
+numpy

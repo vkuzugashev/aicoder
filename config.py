@@ -7,9 +7,9 @@ load_dotenv()
 
 class Config:
     # API
-    MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen3-Coder-Next")
+    MODEL_NAME = os.getenv("MODEL_NAME", "")
     MODEL_URL = os.getenv("MODEL_URL", "https://foundation-models.api.cloud.ru/v1")
-    API_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("API_KEY", "")
+    API_KEY = os.getenv("API_KEY", "")
     
     # Модель
     TEMPERATURE = float(os.getenv("TEMPERATURE", "0.5"))

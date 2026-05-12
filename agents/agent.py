@@ -13,6 +13,7 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 
+import httpx
 from langchain.chat_models import init_chat_model
 from langgraph.graph import StateGraph, END, START
 from langgraph.graph.message import add_messages
@@ -26,6 +27,7 @@ from langchain_core.messages.utils import count_tokens_approximately
 from langchain_core.runnables import RunnableConfig
 
 import aiosqlite
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent.parent))
 
@@ -35,7 +37,7 @@ from utils.summarizer import Summarizer
 from utils.metrics import metrics
 
 from tools.file_tools import (
-    list_dir, read_file, write_file, create_dir,
+    list_dir, read_file, write_file, create_dir, copy_file,
     file_exists, dir_exists, delete_dir, delete_file, pwd
 )
 from tools.build_tools import npm_install, npm_build
@@ -52,11 +54,14 @@ for lib in ["httpx", "httpcore", "langchain", "langgraph"]:
 
 logger = logging.getLogger(__name__)
 
+agent = None
+
 # ===== ИНСТРУМЕНТЫ =====
 tools = [
     list_dir, read_file, write_file, create_dir,
     file_exists, dir_exists, delete_dir, delete_file,
-    npm_install, npm_build, pwd, search_codebase
+    npm_install, npm_build, pwd, search_codebase,
+    copy_file
 ]
 
 # ===== ЗАГРУЗКА ПРОМПТА =====
@@ -84,12 +89,35 @@ summarizer = Summarizer(model)
 executor = ThreadPoolExecutor(max_workers=2)
 
 # ===== RAG КЭШ =====
-@lru_cache(maxsize=100)
-def _cached_rag_search(query_hash: str) -> str:
-    """Кэшированный RAG поиск (не используется напрямую)"""
-    return ""
-
 rag_cache: Dict[str, tuple] = {}  # query -> (result, timestamp)
+MAX_CACHE_SIZE = 200
+CACHE_TTL = 300  # 5 минут
+
+def get_cached_rag(query: str) -> Optional[str]:
+    """Получить результат RAG из кэша"""
+    cache_key = query[:100]
+    if cache_key in rag_cache:
+        result, timestamp = rag_cache[cache_key]
+        if time.time() - timestamp < CACHE_TTL:
+            return result
+        else:
+            # Удаляем устаревший кэш
+            del rag_cache[cache_key]
+    return None
+
+def set_cached_rag(query: str, result: str):
+    """Сохранить результат RAG в кэш"""
+    cache_key = query[:100]
+    
+    # Автоочистка при переполнении
+    if len(rag_cache) >= MAX_CACHE_SIZE:
+        # Удаляем 50% самых старых записей
+        sorted_cache = sorted(rag_cache.items(), key=lambda x: x[1][1])
+        for old_key, _ in sorted_cache[:MAX_CACHE_SIZE // 2]:
+            del rag_cache[old_key]
+    
+    rag_cache[cache_key] = (result, time.time())
+
 
 # ===== СОСТОЯНИЕ =====
 class AgentState(TypedDict):
@@ -104,13 +132,13 @@ class AgentState(TypedDict):
 # ===== RAG поиск с кэшем =====
 async def background_rag_search(query: str) -> str:
     """Фоновый RAG поиск с кэшированием"""
-    # Проверяем кэш
-    cache_key = query[:100]  # Первые 100 символов как ключ
-    if cache_key in rag_cache:
-        result, timestamp = rag_cache[cache_key]
-        if time.time() - timestamp < 300:  # 5 минут кэш
-            return result
     
+    # 1. Проверяем кэш
+    cached = get_cached_rag(query)
+    if cached is not None:
+        return cached
+    
+    # 2. Если нет в кэше — ищем в ChromaDB
     loop = asyncio.get_event_loop()
     docs = await loop.run_in_executor(executor, rag_store.search, query, 5)
     
@@ -128,16 +156,20 @@ async def background_rag_search(query: str) -> str:
             for src, contents in by_file.items()
         ])
         
-        # Кэшируем
-        rag_cache[cache_key] = (result, time.time())
+        # 3. Сохраняем в кэш
+        set_cached_rag(query, result)
+        
         return result
     
+    # 4. Кэшируем даже пустой результат
+    set_cached_rag(query, "")
     return ""
+
 
 # ===== УЗЛЫ ГРАФА =====
 
 async def check_context(state: AgentState) -> dict:
-    """Проверка и очистка контекста"""
+    """Проверка и очистка контекста с сохранением в checkpoint"""
     messages = state["messages"]
     tokens = sum(
         count_tokens_approximately(m.content)
@@ -159,18 +191,33 @@ async def check_context(state: AgentState) -> dict:
     if tokens > config.SUMMARIZE_AT and len(messages) > 10:
         logger.info(f"Суммаризация: {tokens:,} токенов")
         summary, new_messages, saved = await summarizer.summarize(messages)
-        if summary:
+        
+        if summary and len(new_messages) < len(messages):
+            print(f"\n📝 Суммаризация: {tokens:,} → {sum(count_tokens_approximately(m.content) for m in new_messages if hasattr(m, 'content')):,} токенов")
+            print(f"   Сообщений: {len(messages)} → {len(new_messages)}")
+            
             return {
                 "summary": summary,
-                "messages": new_messages,
+                "messages": new_messages,  # ← Заменяем старые на сжатые
                 "summarizations": state.get("summarizations", 0) + 1,
                 "tokens_saved": state.get("tokens_saved", 0) + saved
             }
     
     return {}
 
+# ===== ПОВТОРНЫЕ ПОПЫТКИ ДЛЯ ВЫЗОВА МОДЕЛИ =====
+@retry(
+    retry=retry_if_exception_type((httpx.RemoteProtocolError, ConnectionError, asyncio.TimeoutError)),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    reraise=True
+)
+async def _invoke_model(messages: list):
+    """Вызов модели с повторными попытками при ошибках сети"""
+    return await model.ainvoke(messages)
+
 async def call_model(state: AgentState) -> dict:
-    """Вызов модели с RAG контекстом"""
+    """Вызов модели с RAG контекстом и повторными попытками"""
     messages = list(state["messages"])
     summary = state.get("summary", "")
     
@@ -193,12 +240,18 @@ async def call_model(state: AgentState) -> dict:
         rag_context = await background_rag_search(last_human)
         if rag_context:
             full_messages.append(SystemMessage(
-                content=f"🔍 Релевантный код из VB6 проекта:\n{rag_context}\n\nИспользуй этот код для ответа."
+                content=f"🔍 Код из VB6 проекта:\n{rag_context}"
             ))
     
-    full_messages.extend(messages)
+    full_messages.extend(messages)  # ← Добавляем все сообщения
     
-    response = await model.ainvoke(full_messages)
+    # Вызов с повторными попытками
+    try:
+        response = await _invoke_model(full_messages)
+    except Exception as e:
+        logger.error(f"Ошибка вызова модели после 3 попыток: {e}")
+        return {"messages": [AIMessage(content=f"❌ Не удалось получить ответ от модели.")]}
+    
     return {"messages": [response]}
 
 def should_continue(state: AgentState) -> str:
@@ -405,15 +458,22 @@ class ModernAgent:
 _shutdown_requested = False
 
 def signal_handler(sig, frame):
-    global _shutdown_requested
+    global _shutdown_requested, agent
     _shutdown_requested = True
     print(f"\n👋 Получен сигнал завершения...")
+    print("⏳ Ожидание завершения текущей операции...")
+    
+    # Если есть активный агент — принудительно завершаем
+    if agent:
+        asyncio.create_task(agent.force_shutdown())
+
 
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 # ===== ЗАПУСК =====
 async def main():
+    global agent
     os.system('clear' if os.name != 'nt' else 'cls')
     
     print("=" * 70)
@@ -462,7 +522,7 @@ async def main():
                     print(f"   Токенов: {s['total_tokens']}")
                     print(f"   Среднее время: {s['avg_time']}")
                     print(f"   Аптайм: {s['uptime']}")
-                    print(f"   RAG кэш: {s['rag_cache_size']} запросов")
+                    print(f"📚 RAG кэш: {s['rag_cache_size']} запросов")                    
                     if s.get('tools'):
                         print(f"   🔧 Инструменты: {dict(list(s['tools'].items())[:5])}")
                     continue
@@ -473,7 +533,7 @@ async def main():
                 
                 elif cmd == "clear":
                     rag_cache.clear()
-                    print("🧹 RAG кэш очищен")
+                    print(f"🧹 RAG кэш очищен")
                     continue
                 
                 elif cmd == "help":

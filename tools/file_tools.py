@@ -185,6 +185,21 @@ def delete_file(path: str):
         return f"❌ Файл не найден: '{path}'"
 
 @tool
+def copy_file(path: str, pathto: str):
+    """Копирует файл из path в pathto."""
+    file_path = _safe_path(path, WORK_DIR)
+    if file_path.exists():
+        try:
+            file_path.unlink()
+            os.copyfile(file_path, pathto)
+            print(f"🗑️ Файл скопирован: {path} -> {pathto}")
+            return f'✅ Файл успешно удалён'
+        except Exception as e:
+            return f"❌ Ошибка при копировании файла: {str(e)}"
+    else:
+        return f"❌ Файл не найден: '{path}'"
+
+@tool
 def file_exists(path: str):
     """
     Проверяет, существует ли файл.
